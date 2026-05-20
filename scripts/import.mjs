@@ -2,6 +2,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const NOTION_DB_ID = '1e86282d-955a-8052-99e4-d25fd6b6e49e';
 const NOTION_VERSION = '2022-06-28';
@@ -96,12 +100,13 @@ const TERMS_SECTION_HEADINGS = [
 const DOUJIN_OVERRIDE_MAP = { allow: '允許', inquire: '徵詢', prohibit: '禁止' };
 
 function parseArgs(argv) {
-  const args = { url: null, dryRun: false, doujinOverride: undefined };
+  const args = { url: null, dryRun: false, doujinOverride: undefined, noVN3Auto: false };
   const rest = argv.slice(2);
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     if (a === '--dry-run') args.dryRun = true;
     else if (a === '-h' || a === '--help') args.help = true;
+    else if (a === '--no-vn3-auto') args.noVN3Auto = true;
     else if (a === '--doujin') {
       const v = rest[++i];
       if (!['allow', 'inquire', 'prohibit', 'clear'].includes(v)) {
@@ -115,15 +120,17 @@ function parseArgs(argv) {
 }
 
 function usage() {
-  console.log(`usage: import.mjs <booth_url> [--dry-run] [--doujin <allow|inquire|prohibit|clear>]
+  console.log(`usage: import.mjs <booth_url> [--dry-run] [--doujin <value>] [--no-vn3-auto]
 
   <booth_url>          e.g. https://isekaisuzuya.booth.pm/items/7910491
   --dry-run            print extracted fields + Notion payload + doujin evidence, no write
-  --doujin <value>     force 可用於同人製作 = 允許/徵詢/禁止 (overrides auto-detect)
-                       clear = explicitly clear the field
+  --doujin <value>     force 可用於同人製作 = allow|inquire|prohibit|clear (overrides auto-detect)
+  --no-vn3-auto        skip the VN3 PDF auto-extraction step (use when offline / pypdf missing)
 
 env:
   NOTION_API_KEY  Notion integration token (fallback: openclaw.json)
+
+VN3 auto-extraction requires: python3 + pypdf  (pip3 install pypdf)
 `);
 }
 
@@ -245,6 +252,98 @@ function parseDoujinInfo(data, html) {
     termsText,
     licenseUrls: extractLicenseUrls(termsText),
   };
+}
+
+// ── VN3 auto-extraction (Drive PDF → R-row → 允許/徵詢/禁止) ─────
+
+const VN3_LANG_PATTERNS = {
+  jp: /(jp|日本語|規約全文|japanese|ja\b)/i,
+  en: /(\ben\b|english|terms\s+of\s+use)/i,
+  zh: /(\bzh\b|中文|使用条款|使用條款|chinese)/i,
+  ko: /(\bko\b|한국|이용규약|korean)/i,
+};
+const VN3_LANG_PRIORITY = ['jp', 'en', 'zh', 'ko', 'unknown'];
+
+function detectLang(label) {
+  for (const [lang, re] of Object.entries(VN3_LANG_PATTERNS)) {
+    if (re.test(label)) return lang;
+  }
+  return 'unknown';
+}
+
+function pickPreferredLicenseUrl(termsText, urls) {
+  if (!termsText) return urls[0];
+  const tagged = urls.map(url => {
+    const idx = termsText.indexOf(url);
+    const label = idx < 0 ? '' : termsText.slice(Math.max(0, idx - 100), idx);
+    return { url, lang: detectLang(label) };
+  });
+  tagged.sort((a, b) => VN3_LANG_PRIORITY.indexOf(a.lang) - VN3_LANG_PRIORITY.indexOf(b.lang));
+  return tagged[0].url;
+}
+
+function driveToDownloadUrl(url) {
+  const m = url.match(/drive\.google\.com\/file\/d\/([^/]+)/);
+  return m ? `https://drive.google.com/uc?export=download&id=${m[1]}` : url;
+}
+
+async function downloadPdfToTemp(url) {
+  const res = await fetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0 vrchat-asset-importer' },
+    redirect: 'follow',
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+  const ct = res.headers.get('content-type') || '';
+  if (!/pdf|octet-stream|binary/i.test(ct)) {
+    throw new Error(`unexpected content-type: ${ct} (likely a Drive confirm/auth page, not a PDF)`);
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  const dest = path.join(os.tmpdir(), `vn3-${Date.now()}-${process.pid}.pdf`);
+  fs.writeFileSync(dest, buf);
+  return { path: dest, bytes: buf.length };
+}
+
+async function attemptVN3Auto(termsText, licenseUrls) {
+  if (!licenseUrls?.length) return { ok: false, error: 'no license URLs' };
+  const url = pickPreferredLicenseUrl(termsText, licenseUrls);
+  const downloadUrl = driveToDownloadUrl(url);
+
+  let pdf;
+  try {
+    pdf = await downloadPdfToTemp(downloadUrl);
+  } catch (e) {
+    return { ok: false, error: `download failed: ${e.message}`, fromUrl: url };
+  }
+
+  const scriptPath = path.join(__dirname, 'extract-vn3.py');
+  const result = spawnSync('python3', [scriptPath, pdf.path], { encoding: 'utf-8' });
+
+  // best-effort cleanup
+  try { fs.unlinkSync(pdf.path); } catch {}
+
+  if (result.error) {
+    return {
+      ok: false,
+      error: `python3 unavailable: ${result.error.message}`,
+      hint: 'install python3, then `pip3 install pypdf`',
+      fromUrl: url,
+    };
+  }
+  if (result.status === 2) {
+    return { ok: false, error: 'pypdf not installed', hint: 'pip3 install pypdf', fromUrl: url };
+  }
+  let parsed;
+  try { parsed = JSON.parse(result.stdout); }
+  catch {
+    return {
+      ok: false,
+      error: `extract-vn3.py output not JSON (exit ${result.status})`,
+      stderr: (result.stderr || '').slice(0, 200),
+      fromUrl: url,
+    };
+  }
+  if (parsed.error) return { ok: false, error: parsed.error, hint: parsed.hint, fromUrl: url };
+  return { ok: true, ...parsed, fromUrl: url, pdfBytes: pdf.bytes };
 }
 
 function pickPrice(data) {
@@ -417,15 +516,38 @@ async function main() {
   const { onSale, saleEndDate } = parseSaleInfo(data);
   const doujinInfo = parseDoujinInfo(data, html);
 
+  // VN3 auto-extraction kicks in when keyword tier missed but we have license URLs.
+  let vn3Auto = null;
+  const shouldTryVN3 =
+    !args.noVN3Auto &&
+    !args.doujinOverride &&
+    !doujinInfo.decision &&
+    doujinInfo.licenseUrls.length > 0;
+  if (shouldTryVN3) {
+    vn3Auto = await attemptVN3Auto(doujinInfo.termsText, doujinInfo.licenseUrls);
+  }
+
   // Decide doujin value:
   //   --doujin allow/inquire/prohibit → 允許/徵詢/禁止  (doujinExplicit=true)
   //   --doujin clear                  → null            (doujinExplicit=true → write null to clear)
-  //   no flag, auto-decision exists   → 允許/徵詢/禁止  (doujinExplicit=false)
-  //   no flag, no decision            → null            (doujinExplicit=false → don't touch field)
-  let doujin = null, doujinExplicit = false;
-  if (args.doujinOverride === 'clear') { doujin = null; doujinExplicit = true; }
-  else if (args.doujinOverride)        { doujin = DOUJIN_OVERRIDE_MAP[args.doujinOverride]; doujinExplicit = true; }
-  else if (doujinInfo.decision)        { doujin = doujinInfo.decision; }
+  //   keyword tier hit                → 允許/徵詢/禁止  (doujinSource='auto-keyword')
+  //   VN3 auto succeeded              → 允許/徵詢/禁止  (doujinSource='vn3-auto')
+  //   no signal                       → null            (don't touch field)
+  let doujin = null, doujinExplicit = false, doujinSource = 'none';
+  if (args.doujinOverride === 'clear') {
+    doujinExplicit = true;
+    doujinSource = 'override:clear';
+  } else if (args.doujinOverride) {
+    doujin = DOUJIN_OVERRIDE_MAP[args.doujinOverride];
+    doujinExplicit = true;
+    doujinSource = `override:${args.doujinOverride}`;
+  } else if (doujinInfo.decision) {
+    doujin = doujinInfo.decision;
+    doujinSource = 'auto-keyword';
+  } else if (vn3Auto?.ok) {
+    doujin = DOUJIN_OVERRIDE_MAP[vn3Auto.decision];
+    doujinSource = `vn3-auto:${vn3Auto.decision}`;
+  }
 
   const extracted = {
     name:        data.name,
@@ -438,9 +560,7 @@ async function main() {
     saleEndDate,
     avatars:     matchAvatars(data),
     doujin,
-    doujinSource: args.doujinOverride ? `override:${args.doujinOverride}`
-                : doujinInfo.decision   ? 'auto'
-                : 'none',
+    doujinSource,
   };
 
   console.log('=== extracted ===');
@@ -448,16 +568,24 @@ async function main() {
 
   console.log('\n=== doujin evidence ===');
   console.log(JSON.stringify({
-    autoDecision: doujinInfo.decision,
-    keywordHits:  doujinInfo.keywordHits,
-    licenseUrls:  doujinInfo.licenseUrls,
-    termsExcerpt: doujinInfo.termsText ? doujinInfo.termsText.slice(0, 600) : null,
+    autoKeywordDecision: doujinInfo.decision,
+    keywordHits:         doujinInfo.keywordHits,
+    licenseUrls:         doujinInfo.licenseUrls,
+    termsExcerpt:        doujinInfo.termsText ? doujinInfo.termsText.slice(0, 600) : null,
+    vn3Auto,
   }, null, 2));
 
-  if (doujinInfo.licenseUrls.length && !args.doujinOverride) {
-    console.log('\n→ LLM 行動：用 WebFetch 抓上面的 licenseUrls（優先 JP 版），找 VN3 表格的 R 欄');
-    console.log('  R 欄全文：「将该数位文件作为特定商用产品等电子软件的一部分」');
-    console.log('  ○ → --doujin allow   △ → --doujin inquire   ✕ → --doujin prohibit');
+  if (
+    doujinInfo.licenseUrls.length &&
+    !args.doujinOverride &&
+    !doujinInfo.decision &&
+    !(vn3Auto?.ok)
+  ) {
+    console.log('\n⚠ VN3 auto-extraction unavailable. Options:');
+    console.log('  1. Install pypdf:  pip3 install pypdf  (then re-run)');
+    console.log('  2. Read the PDF manually (WebFetch the JP Drive link, find row R) and run:');
+    console.log('       --doujin allow|inquire|prohibit');
+    if (vn3Auto?.hint) console.log(`  hint: ${vn3Auto.hint}`);
   }
 
   const properties = buildProperties({ ...extracted, doujinExplicit });
