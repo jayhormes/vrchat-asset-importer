@@ -28,9 +28,9 @@ node <SKILL_DIR>/scripts/import.mjs <booth_url> --dry-run
 # Step 2 — write (auto-detect 可用於同人製作 may stay blank)
 node <SKILL_DIR>/scripts/import.mjs <booth_url>
 
-# Step 3 — if dry-run shows licenseUrls but no auto decision:
-#   - WebFetch the JP Drive PDF (see "Tier B" section below for the URL trick + pypdf extraction)
-#   - find the "R." row, then commit:
+# Step 3 — only if Step 2 returned `vn3Auto.ok=false` (script's auto VN3 extraction failed):
+#   First, try to make auto work (install pypdf, etc — see Tier B fallback table).
+#   Last resort, read the PDF manually and force-write:
 node <SKILL_DIR>/scripts/import.mjs <booth_url> --doujin allow|inquire|prohibit
 ```
 
@@ -41,10 +41,10 @@ If a field comes out wrong, the fix is almost always **add a keyword to a table 
 ## Requirements
 
 - **Node 18+** (for built-in `fetch`)
-- **Network**: outbound to `booth.pm`, `booth.pximg.net`, `api.notion.com`
+- **Network**: outbound to `booth.pm`, `booth.pximg.net`, `api.notion.com`, `drive.google.com` (for VN3)
 - **Notion token**: read from `$NOTION_API_KEY` or `~/.openclaw/openclaw.json` `skills.entries.notion.env.NOTION_API_KEY`
 - **Notion integration must be Connected** to the target DB
-- **(Optional, for Tier B VN3 PDF parsing)** `python3` + `pypdf`. If absent, agent must either install `pip3 install pypdf` (or `brew install poppler` for `pdftotext` as alternative), or fall back to asking the user.
+- **`python3` + `pypdf`** — required for VN3 auto-extraction (Tier B). Install: `pip3 install pypdf`. Without this, agent must do Tier B manually or use `--doujin <value>`.
 
 ## Usage
 
@@ -119,56 +119,45 @@ $ node ~/.openclaw/skills/vrchat-asset-importer/scripts/import.mjs \
 
 腳本在 `name + description + 利用規約段落` 找 `DOUJIN_ALLOW_KEYWORDS / DOUJIN_PROHIBIT_KEYWORDS / DOUJIN_INQUIRE_KEYWORDS`，優先順序 prohibit > inquire > allow（保守判斷）。命中即寫入，不需 LLM。
 
-### Tier B — 頁面附 VN3 license 連結（LLM 用 WebFetch 看 R 欄）
+### Tier B — 頁面附 VN3 license 連結（**全自動，script 直接判**）
 
-booth 的「利用規約」段落（位於 HTML `<section class="shop__text">` 中）若含 Google Drive / Docs / PDF / Notion 連結，腳本會在 dry-run 輸出 `licenseUrls`，並提示 LLM：
+booth 的「利用規約」段落（位於 HTML `<section class="shop__text">` 中）若含 Google Drive / Docs / PDF / Notion 連結，腳本會自動完成下面整套流程：
 
-> R 欄全文：「将该数位文件作为特定商用产品等电子软件的一部分」（ZH）  
-> JP 等價說法：「製品開発等のためにソフトウェア（ゲームを含みます）へ組み込み」  
-> EN 等價說法：「Incorporating ... as part of commercial products such as electronic software」
+1. 從 terms section 取出 license URLs
+2. 用 URL 前面的語言標籤挑優先版本（JP > EN > ZH > KO > unknown）
+3. Drive `/file/d/.../view` URL 自動轉成 `/uc?export=download&id=...`
+4. Node fetch 下載 PDF 到 `$TMPDIR/vn3-*.pdf`
+5. 呼叫 `scripts/extract-vn3.py`（pypdf）抽文字、定位 R 列、比對狀態關鍵字
+6. 對應到 `允許 / 徵詢 / 禁止` 寫進 Notion（`doujinSource = "vn3-auto:<value>"`）
 
-#### LLM 抓 Drive PDF 的標準流程
+> R 欄全文：「製品開発等のためにソフトウェア（ゲームを含みます）へ組み込み」（JP）  
+> ZH 等價：「将该数位文件作为特定商用产品等电子软件的一部分」  
+> EN 等價：「Incorporating ... as part of commercial products such as electronic software」
 
-Drive 的 `/file/d/.../view` URL **不能直接 WebFetch**（會被導向登入頁），要改用下載 URL：
+#### 自動判斷無法完成時的 fallback
 
-```
-https://drive.google.com/file/d/<FILE_ID>/view?usp=sharing
-  ↓ 轉換
-https://drive.google.com/uc?export=download&id=<FILE_ID>
-  ↓ WebFetch 會回 redirect 到
-https://drive.usercontent.google.com/download?id=<FILE_ID>&export=download
-```
+dry-run 會輸出 `vn3Auto: { ok: false, error: "...", hint: "..." }`。常見原因與對策：
 
-PDF 多半是**圖片型**（VN3 表格用 ○△✕ 圖示），WebFetch 看不到內文。Drive 下載完的 PDF 會被存到 tool-results 目錄，用 `pypdf` 抽文字。
+| `error` | 對策 |
+|---|---|
+| `pypdf not installed` | `pip3 install pypdf`，重跑 |
+| `python3 unavailable: ...` | 確認 `which python3`；macOS 內建有，沒有就 `brew install python` |
+| `download failed: HTTP 4xx` | Drive 連結權限變動或失效，回報主人 |
+| `unexpected content-type: text/html` | Drive 出 confirm/auth interstitial（罕見），手動 WebFetch |
+| `R row not found` | PDF 是純圖片版（VN3 表格沒可選文字），用下方手動流程 |
+| `no status keyword matched in R context` | 作者用了 alias 表沒有的措辭。把 `r_context` 裡的狀態詞 push 進 `extract-vn3.py` 的 `ALLOW_KW/PROHIBIT_KW/INQUIRE_KW` |
 
-**pypdf 未安裝**：先 `pip3 install pypdf`。若無法安裝，fallback 是 `brew install poppler` 然後改用 `pdftotext -layout "$PDF" - | grep -A1 "R\\."`；兩者都失敗就直接告知主人並設 `--doujin inquire`（保守）。
+#### 手動 fallback（最後手段，自動失敗時）
 
 ```bash
-PDF="<path from WebFetch result>"
-python3 -c "
-import pypdf, re
-r = pypdf.PdfReader('$PDF')
-text = '\n'.join((p.extract_text() or '') for p in r.pages)
-# pypdf 對 CJK 會插空白，要壓縮
-text = re.sub(r'(?<=[^\x00-\x7f])\s+(?=[^\x00-\x7f])', '', text)
-text = re.sub(r'\s+', ' ', text)
-# 找 R 列
-for m in re.finditer(r'(?<![A-Za-z])R[\.\s]', text):
-    s = max(0, m.start()-30); e = min(len(text), m.end()+250)
-    print(text[s:e])
-    print('---')
-"
+# 把 Drive /view 改成 /uc?export=download&id=
+curl -sL -o /tmp/vn3.pdf 'https://drive.google.com/uc?export=download&id=<FILE_ID>'
+
+# 直接呼叫 helper
+python3 <SKILL_DIR>/scripts/extract-vn3.py /tmp/vn3.pdf
 ```
 
-R 欄結果 → 寫回 Notion：
-
-| PDF 文字 | flag |
-|---|---|
-| 許可します / 許可 / ○ | `--doujin allow` |
-| 権利者に個別に問い合わせて下さい / 要相談 / △ | `--doujin inquire` |
-| 許可しません / 不許可 / 禁止 / ✕ | `--doujin prohibit` |
-
-優先抓 JP 版（多半最詳細、最權威）。其他語版若 JP 失敗才用。
+若 helper 仍判不出（如純圖片 PDF），最後手段：WebFetch 出 PDF binary、人工檢查 R 欄、用 `--doujin allow|inquire|prohibit` 強制寫入。
 
 ### Tier C — 外部規約頁面 / 描述需判讀（LLM WebFetch + 自行判斷）
 

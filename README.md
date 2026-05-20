@@ -16,7 +16,7 @@ Given a Booth item URL, this skill auto-extracts product info and writes a fully
 | Full Set | FULL PACK variation match | only sets `true`, never unticks |
 | 特價 / 特價至 | description scan | overwritten on every run |
 | 適用於 | description + tags + variations | multi-language alias table |
-| 可用於同人製作 | 3-tier: keyword → VN3 R-column → external link | see [SKILL.md](./SKILL.md) |
+| 可用於同人製作 | 3-tier: keyword → **VN3 PDF auto-extract (pypdf)** → external link | see [SKILL.md](./SKILL.md) |
 
 Re-running on the same URL **updates in place** (matched by URL).
 
@@ -64,9 +64,7 @@ node <SKILL_DIR>/scripts/import.mjs <url> --doujin allow|inquire|prohibit|clear
 
 - **Node 18+** (for built-in `fetch`)
 - **Notion integration**, Connected to the target DB, with read/write
-- **(Optional, for Tier B VN3 PDF parsing)** `python3` + `pypdf`
-  - Fallback: `brew install poppler` (provides `pdftotext`)
-  - Both unavailable → script outputs `licenseUrls`; agent should ask the user
+- **`python3` + `pypdf`** — required for the VN3 license auto-extraction (Tier B). Install with `pip3 install pypdf`. Without it, the agent must read the PDF manually and pass `--doujin <value>`.
 
 ## For agents picking this up
 
@@ -74,7 +72,7 @@ The full LLM workflow lives in [SKILL.md](./SKILL.md). Key points:
 
 1. **Always start with `--dry-run`.** Output shows extracted fields + Notion payload + doujin evidence (matched keywords, VN3 license URLs, terms text excerpt).
 2. **If a field is missing**, the fix is almost always **add a string to a keyword table** at the top of [`scripts/import.mjs`](./scripts/import.mjs). Never edit the logic functions below the `LOGIC` divider.
-3. **For VN3 license PDFs** (Tier B), use `https://drive.google.com/uc?export=download&id=<FILE_ID>` (not `/view`), then `pypdf` to extract row R. See SKILL.md § "LLM 抓 Drive PDF 的標準流程".
+3. **VN3 license PDFs are auto-handled** by `scripts/extract-vn3.py` (requires `python3 + pypdf`). If `vn3Auto.ok=false` in dry-run, see SKILL.md § "自動判斷無法完成時的 fallback" for the error→fix table.
 4. **When ambiguous**, write `--doujin inquire` (the conservative default) rather than guessing `allow`. The 4 ambiguity triggers are listed in SKILL.md § "Tier C".
 
 ## Customization
