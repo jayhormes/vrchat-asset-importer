@@ -51,10 +51,10 @@ node ./vrchat-asset-importer/scripts/import.mjs <booth_url> --dry-run
 
 ```bash
 # Preview what will be written (no API call)
-node <SKILL_DIR>/scripts/import.mjs https://booth.pm/zh-tw/items/4816969 --dry-run
+node <SKILL_DIR>/scripts/import.mjs https://booth.pm/zh-tw/items/4590436 --dry-run
 
 # Create (or update if URL already in DB)
-node <SKILL_DIR>/scripts/import.mjs https://booth.pm/zh-tw/items/4816969
+node <SKILL_DIR>/scripts/import.mjs https://booth.pm/zh-tw/items/4590436
 
 # Override 可用於同人製作 (after reading VN3 license PDF)
 node <SKILL_DIR>/scripts/import.mjs <url> --doujin allow|inquire|prohibit|clear
