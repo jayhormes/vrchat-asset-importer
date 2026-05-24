@@ -5,10 +5,21 @@ import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+import {
+  NOTION_DB_ID,
+  FULL_PACK_KEYWORDS,
+  SALE_KEYWORDS,
+  isBoothUrl,
+  toJsonUrl,
+  fetchJson,
+  fetchText,
+  pickPrice,
+  parseSaleInfo,
+  readToken,
+  Notion,
+} from './lib.mjs';
 
-const NOTION_DB_ID = '1e86282d-955a-8052-99e4-d25fd6b6e49e';
-const NOTION_VERSION = '2022-06-28';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ─────────────────────────────────────────────────────────────────
 //  KEYWORD TABLES
@@ -49,19 +60,8 @@ const TYPE_KEYWORDS = {
   },
 };
 
-// 命中即「Full Set + 價格 = 該 variation」。比對對象是 variations[].name（不分大小寫）。
-const FULL_PACK_KEYWORDS = [
-  'FULL PACK', 'FULLPACK', 'FULL_PACK',
-  'フルパック', 'フルセット', 'フル パック',
-  'Full Set', 'FullSet',
-];
-
-// 「特價」判斷：在 name + description 做 substring 比對（不分大小寫）。
-// 結構性 pattern「<數字>%OFF」是另外用 regex 處理（在 parseSaleInfo 內），不放這裡。
-const SALE_KEYWORDS = [
-  '半額', 'セール', 'SALE', '割引', '特価', '特價',
-  '大感謝', 'キャンペーン',
-];
+// 提示：FULL_PACK_KEYWORDS 與 SALE_KEYWORDS 在 ./lib.mjs，被本 skill
+// 與 vrchat-sales-sync 共用。要新增關鍵字請改 lib.mjs，兩個 skill 都會同步。
 
 // 「可用於同人製作」自動判斷的關鍵字。
 // 優先順序：prohibit > inquire > allow（保守判斷，「禁止」最強）。
@@ -70,7 +70,8 @@ const DOUJIN_ALLOW_KEYWORDS = [
   '商用利用OK', '商用利用可', '商用OK',
   'ゲーム制作可', 'ゲーム使用可', 'ゲーム制作OK', 'ゲーム使用OK',
   '同人ゲーム使用可', '同人OK', '同人利用OK',
-  '自作ゲームに使用可', '商業利用可',
+  '自作ゲームに使用可',
+  '自由に使用', '没有问题',
 ];
 const DOUJIN_PROHIBIT_KEYWORDS = [
   '商用利用不可', '商用利用禁止', '商用利用を禁止', '商用NG',
@@ -82,6 +83,10 @@ const DOUJIN_INQUIRE_KEYWORDS = [
   '商用利用は要問合せ', '商用は要相談', '商用利用は要相談',
   'ゲーム使用は要問合せ', 'ゲーム使用は要相談',
   '商業利用は要問合せ',
+  '必ずBOOTHメッセージにてご連絡ください',
+  ' Bochにてご連絡ください',
+  'DMにてご連絡ください', 'DMください',
+  '個別にお問い合わせ', '要相談', '要確認',
 ];
 
 // 「利用規約」段落的 <h2> 標題判斷（HTML 內 <section class="shop__text"> 多段）。
@@ -137,60 +142,6 @@ VN3 auto-extraction requires: python3 + pypdf  (pip3 install pypdf)
 function die(msg, code = 1) {
   console.error(`ERROR: ${msg}`);
   process.exit(code);
-}
-
-function readToken() {
-  if (process.env.NOTION_API_KEY) return process.env.NOTION_API_KEY;
-  try {
-    const p = path.join(os.homedir(), '.openclaw', 'openclaw.json');
-    const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
-    return cfg?.skills?.entries?.notion?.env?.NOTION_API_KEY || null;
-  } catch { return null; }
-}
-
-function isBoothUrl(s) {
-  try {
-    const u = new URL(s);
-    return /(^|\.)booth\.pm$/.test(u.hostname) && /\/items\/\d+/.test(u.pathname);
-  } catch { return false; }
-}
-
-function toJsonUrl(s) {
-  const u = new URL(s);
-  u.search = ''; u.hash = '';
-  let p = u.pathname.replace(/\/+$/, '');
-  if (!p.endsWith('.json')) p += '.json';
-  u.pathname = p;
-  return u.toString();
-}
-
-async function fetchJson(url, opts = {}) {
-  const res = await fetch(url, {
-    ...opts,
-    headers: {
-      'User-Agent': 'Mozilla/5.0 vrchat-asset-importer',
-      'Accept': 'application/json',
-      ...(opts.headers || {}),
-    },
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`HTTP ${res.status} ${res.statusText}\n${body.slice(0, 500)}`);
-  }
-  return res.json();
-}
-
-async function fetchText(url, opts = {}) {
-  const res = await fetch(url, {
-    ...opts,
-    headers: {
-      'User-Agent': 'Mozilla/5.0 vrchat-asset-importer',
-      'Accept': 'text/html,application/xhtml+xml',
-      ...(opts.headers || {}),
-    },
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-  return res.text();
 }
 
 function stripTags(s) { return s.replace(/<[^>]+>/g, ''); }
@@ -346,51 +297,6 @@ async function attemptVN3Auto(termsText, licenseUrls) {
   return { ok: true, ...parsed, fromUrl: url, pdfBytes: pdf.bytes };
 }
 
-function pickPrice(data) {
-  const vars = Array.isArray(data.variations) ? data.variations : [];
-  if (vars.length === 0) {
-    const m = String(data.price ?? '').match(/(\d[\d,]*)/);
-    return { price: m ? parseInt(m[1].replace(/,/g, ''), 10) : null, isFullPack: false };
-  }
-  const fullPack = vars.find(v => {
-    const n = (v.name || '').toUpperCase();
-    return FULL_PACK_KEYWORDS.some(k => n.includes(k.toUpperCase()));
-  });
-  if (fullPack && typeof fullPack.price === 'number') {
-    return { price: fullPack.price, isFullPack: true };
-  }
-  const prices = vars.map(v => v.price).filter(p => typeof p === 'number');
-  return { price: prices.length ? Math.max(...prices) : null, isFullPack: false };
-}
-
-function parseSaleEndDate(text) {
-  // pattern A: full date range  2026.05.20〜(2026.)06.20  (end year optional → inherit start year)
-  const rangeRe = /(20\d{2})[.\-/年]\s*(\d{1,2})[.\-/月]\s*(\d{1,2})日?\s*[〜～~\-ー至–—]+\s*(?:(20\d{2})[.\-/年]\s*)?(\d{1,2})[.\-/月]\s*(\d{1,2})日?/;
-  const r = rangeRe.exec(text);
-  if (r) {
-    const [, sy, , , ey, em, ed] = r;
-    return `${ey || sy}-${String(em).padStart(2, '0')}-${String(ed).padStart(2, '0')}`;
-  }
-  // pattern B: single date with まで / until
-  const untilRe = /(20\d{2})[.\-/年]\s*(\d{1,2})[.\-/月]\s*(\d{1,2})日?\s*(?:まで|until)/i;
-  const u = untilRe.exec(text);
-  if (u) {
-    const [, y, m, d] = u;
-    return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-  }
-  return null;
-}
-
-function parseSaleInfo(data) {
-  const text = `${data.name || ''}\n${data.description || ''}`;
-  const lowered = text.toLowerCase();
-  const onSale =
-    /\d+\s*[%％]\s*off/i.test(text) ||
-    SALE_KEYWORDS.some(k => lowered.includes(k.toLowerCase()));
-  const saleEndDate = onSale ? parseSaleEndDate(text) : null;
-  return { onSale, saleEndDate };
-}
-
 function pickType(data) {
   const catName = (data.category?.name || '').toLowerCase();
   for (const [type, kw] of Object.entries(TYPE_KEYWORDS)) {
@@ -461,42 +367,6 @@ function buildProperties({ name, type, thumbnail, url, price, avatars, isFullPac
     props['可用於同人製作'] = { select: null };
   }
   return props;
-}
-
-class Notion {
-  constructor(token) { this.token = token; }
-  async req(p, opts = {}) {
-    return fetchJson(`https://api.notion.com/v1${p}`, {
-      ...opts,
-      headers: {
-        Authorization: `Bearer ${this.token}`,
-        'Notion-Version': NOTION_VERSION,
-        'Content-Type': 'application/json',
-        ...(opts.headers || {}),
-      },
-    });
-  }
-  findByUrl(url) {
-    return this.req(`/databases/${NOTION_DB_ID}/query`, {
-      method: 'POST',
-      body: JSON.stringify({
-        filter: { property: 'URL', url: { equals: url } },
-        page_size: 1,
-      }),
-    }).then(r => r.results?.[0] || null);
-  }
-  create(properties) {
-    return this.req('/pages', {
-      method: 'POST',
-      body: JSON.stringify({ parent: { database_id: NOTION_DB_ID }, properties }),
-    });
-  }
-  update(pageId, properties) {
-    return this.req(`/pages/${pageId}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ properties }),
-    });
-  }
 }
 
 async function main() {
@@ -600,10 +470,10 @@ async function main() {
   if (!token) die('NOTION_API_KEY not set (env or openclaw.json)', 2);
   const notion = new Notion(token);
 
-  const existing = await notion.findByUrl(extracted.url);
+  const existing = await notion.findByUrl(NOTION_DB_ID, extracted.url);
   const page = existing
-    ? await notion.update(existing.id, properties)
-    : await notion.create(properties);
+    ? await notion.updatePage(existing.id, properties)
+    : await notion.createPage(NOTION_DB_ID, properties);
 
   console.log(`\n✓ ${existing ? 'UPDATED' : 'CREATED'}  ${page.url}`);
 }
