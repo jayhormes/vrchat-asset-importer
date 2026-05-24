@@ -22,9 +22,12 @@ Errors print JSON with an "error" field. Exit codes:
   4  R row not located
   5  R row found but no status keyword matched
 """
+from __future__ import annotations
+
 import sys
 import re
 import json
+import unicodedata
 
 
 def fail(code, msg, **extra):
@@ -87,6 +90,9 @@ def main():
     except Exception as e:
         fail(3, f"pdf read failed: {e}")
 
+    # Normalize CJK compatibility glyphs emitted by some PDFs before keyword matching.
+    raw = unicodedata.normalize("NFKC", raw)
+
     # pypdf inserts a space between every CJK char — compress.
     text = re.sub(r"(?<=[^\x00-\x7f])\s+(?=[^\x00-\x7f])", "", raw)
     text = re.sub(r"\s+", " ", text)
@@ -106,6 +112,10 @@ def main():
             return
     for kw in ALLOW_KW:
         if kw in ctx:
+            # 對中文「允许」的特殊處理：出現在「一部分...允许请向」結構時視為 inquire
+            if kw == "允许" and re.search(r"一部分.{0,20}允许", ctx):
+                print(json.dumps({"decision": "inquire", "matched_keyword": kw, "r_context": ctx}, ensure_ascii=False))
+                return
             print(json.dumps({"decision": "allow", "matched_keyword": kw, "r_context": ctx}, ensure_ascii=False))
             return
 
